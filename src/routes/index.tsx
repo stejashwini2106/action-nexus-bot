@@ -6,6 +6,7 @@ import {
   Check,
   CheckCircle2,
   ChevronRight,
+  Clock3,
   Clipboard,
   FileImage,
   HeartPulse,
@@ -20,6 +21,7 @@ import {
   Siren,
   Sparkles,
   StopCircle,
+  Trash2,
   TrafficCone,
   Upload,
   Volume2,
@@ -30,7 +32,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { analyzeBridgeInput, type BridgeResult, type BridgeScenario } from "@/lib/bridgeos.functions";
+import { analyzeBridgeInput, type BridgeExtractedResult, type BridgeResult, type BridgeScenario } from "@/lib/bridgeos.functions";
+import { clearBridgeAudit, makeAuditId, makeAuditPreview, readBridgeAudit, writeBridgeAudit, type BridgeAuditEntry } from "@/lib/bridgeos-audit";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -98,7 +101,8 @@ const demoResults: Record<BridgeScenario, BridgeResult> = {
     ],
     safety: ["Do not wait for symptoms to pass.", "Do not give food, drink, or someone else’s medication.", "This is not a diagnosis—emergency professionals must decide what happens next."],
     missing: ["When did the symptoms begin?", "Is there pain in the arm, jaw, back, or neck?"],
-    verification: ["Urgency matched to symptom cluster", "Human review required", "Location not provided"],
+    verificationNotes: ["Urgency matched to symptom cluster", "Human review required", "Location not provided"],
+    verification: { status: "needs_review", confidence: 0.82, passed: ["Urgent signals have a matching professional-help action", "No diagnosis or medication instruction detected"], failed: ["Timing is not clear", "Location is not clear"], missingFields: ["When it started", "Current location"] },
   },
   civic: {
     urgency: "high", urgencyLabel: "Coordinate soon", confidence: 0.9,
@@ -111,7 +115,8 @@ const demoResults: Record<BridgeScenario, BridgeResult> = {
     ],
     safety: ["Do not stand in the roadway to direct traffic.", "Keep children and cyclists away from the obstruction.", "Avoid touching live wires or unstable branches."],
     missing: ["Exact intersection or nearest address", "Are power lines involved?"],
-    verification: ["Hazard type identified from description", "Photo not provided", "Public works contact not confirmed"],
+    verificationNotes: ["Hazard type identified from description", "Photo not provided", "Public works contact not confirmed"],
+    verification: { status: "needs_review", confidence: 0.78, passed: ["Hazard type identified", "Place or landmark identified", "A safe reporting or warning action is present"], failed: ["Exact place is not clear"], missingFields: ["Exact intersection or nearest address"] },
   },
   accessibility: {
     urgency: "moderate", urgencyLabel: "Find an accessible route", confidence: 0.88,
@@ -124,7 +129,8 @@ const demoResults: Record<BridgeScenario, BridgeResult> = {
     ],
     safety: ["Do not use stairs if they are unsafe for you.", "Do not rely on a sign that is difficult to read—ask a person to confirm.", "Your access need is valid; you do not need to justify it."],
     missing: ["Station name and platform", "Whether staff are currently visible"],
-    verification: ["Access need preserved", "Route availability not verified", "Human assistance recommended"],
+    verificationNotes: ["Access need preserved", "Route availability not verified", "Human assistance recommended"],
+    verification: { status: "needs_review", confidence: 0.8, passed: ["Access need preserved", "Current place identified", "A route or assistance request is present"], failed: ["Availability must be confirmed by staff"], missingFields: ["Station name and platform"] },
   },
 };
 
@@ -136,8 +142,10 @@ function Index() {
   const [mode, setMode] = useState<InputMode>("text");
   const [result, setResult] = useState<BridgeResult | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStage, setProcessingStage] = useState<"idle" | "transcribing" | "checking" | "building">("idle");
   const [error, setError] = useState("");
   const [completed, setCompleted] = useState<number[]>([]);
+  const [auditEntries, setAuditEntries] = useState<BridgeAuditEntry[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const mediaRecorder = useRef<MediaRecorder | null>(null);
@@ -153,6 +161,8 @@ function Index() {
     mediaRecorder.current?.stream.getTracks().forEach((track) => track.stop());
   }, []);
 
+  useEffect(() => setAuditEntries(readBridgeAudit()), []);
+
   const contextLabel = useMemo(() => {
     if (mode === "voice") return isRecording ? `Listening · 00:${String(recordingSeconds).padStart(2, "0")}` : "Voice note ready";
     if (mode === "photo") return imageName || "Add a supporting photo";
@@ -160,24 +170,41 @@ function Index() {
   }, [imageName, isRecording, mode, recordingSeconds]);
 
   const reset = () => {
-    setText(""); setImageDataUrl(null); setImageName(""); setResult(null); setError(""); setCompleted([]); setMode("text");
+    setText(""); setImageDataUrl(null); setImageName(""); setResult(null); setError(""); setCompleted([]); setMode("text"); setProcessingStage("idle");
   };
 
   const selectScenario = (value: BridgeScenario) => {
-    setScenario(value); setResult(null); setError(""); setCompleted([]); setText(""); setImageDataUrl(null); setImageName("");
+    setScenario(value); setResult(null); setError(""); setCompleted([]); setText(""); setImageDataUrl(null); setImageName(""); setMode("text"); setProcessingStage("idle");
   };
 
-  const loadExample = () => { setText(activeScenario.example); setResult(null); setError(""); setMode("text"); };
+  const saveAuditEntry = async (brief: BridgeResult, extracted: BridgeExtractedResult, input: { text: string; imageDataUrl: string | null; mode: InputMode; isExample: boolean }) => {
+    const entry: BridgeAuditEntry = { id: makeAuditId(), createdAt: new Date().toISOString(), scenario, mode: input.mode, text: input.text, imageName, imagePreview: await makeAuditPreview(input.imageDataUrl), extracted, brief, isExample: input.isExample };
+    if (writeBridgeAudit(entry)) setAuditEntries(readBridgeAudit());
+  };
 
-  const processInput = async () => {
-    if (!text.trim() && !imageDataUrl) { setError("Add a note or supporting photo before processing."); return; }
-    setIsProcessing(true); setError(""); setCompleted([]);
+  const processInput = async (override?: { text: string; imageDataUrl: string | null; mode: InputMode; isExample: boolean }) => {
+    const input = override ?? { text: text.trim(), imageDataUrl, mode, isExample: false };
+    if (!input.text.trim() && !input.imageDataUrl) { setError("Add a note or supporting photo before processing."); return; }
+    setIsProcessing(true); setProcessingStage("checking"); setError(""); setCompleted([]);
     try {
-      const response = await analyzeBridgeInput({ data: { scenario, text: text.trim() || "Use the attached photo as the primary context.", imageDataUrl } });
-      setResult(response);
+      setProcessingStage("building");
+      const response = await analyzeBridgeInput({ data: { scenario, text: input.text.trim() || "Use the attached photo as the primary context.", imageDataUrl: input.imageDataUrl } });
+      setResult(response.brief);
+      await saveAuditEntry(response.brief, response.extracted, input);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "BridgeOS could not process that input.");
-    } finally { setIsProcessing(false); }
+      if (input.isExample) {
+        const fallback = demoResults[scenario];
+        setResult(fallback);
+        await saveAuditEntry(fallback, fallback, input);
+        setError("Live AI was unavailable, so BridgeOS loaded the verified demo brief.");
+      } else setError(caught instanceof Error ? caught.message : "BridgeOS could not process that input.");
+    } finally { setIsProcessing(false); setProcessingStage("idle"); }
+  };
+
+  const loadExample = () => {
+    const example = activeScenario.example;
+    setText(example); setResult(null); setError(""); setMode("text");
+    void processInput({ text: example, imageDataUrl: null, mode: "text", isExample: true });
   };
 
   const handlePhoto = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -186,7 +213,11 @@ function Index() {
     if (!file.type.startsWith("image/")) { setError("Please choose an image file."); return; }
     if (file.size > 8 * 1024 * 1024) { setError("Keep images under 8 MB."); return; }
     const reader = new FileReader();
-    reader.onload = () => { setImageDataUrl(String(reader.result)); setImageName(file.name); setMode("photo"); setError(""); };
+     reader.onload = () => {
+       const dataUrl = String(reader.result);
+       setImageDataUrl(dataUrl); setImageName(file.name); setMode("photo"); setError("");
+       if (!text.trim()) void processInput({ text: "Use the attached photo as the primary context.", imageDataUrl: dataUrl, mode: "photo", isExample: false });
+     };
     reader.readAsDataURL(file);
   };
 
@@ -209,14 +240,16 @@ function Index() {
         const blob = new Blob(audioChunks.current, { type: recorder.mimeType || "audio/webm" });
         if (blob.size < 2048) { setError("That recording was empty. Please try again."); return; }
         const form = new FormData(); form.append("file", blob, "bridgeos-recording.webm");
-        setIsProcessing(true);
+         setIsProcessing(true); setProcessingStage("transcribing");
         try {
           const response = await fetch("/api/transcribe", { method: "POST", body: form });
           const payload = await response.json() as { text?: string; error?: string };
           if (!response.ok) throw new Error(payload.error || "Voice processing failed.");
-          setText(payload.text || ""); setMode("text");
+           const transcript = payload.text || "";
+           setText(transcript); setMode("voice");
+           await processInput({ text: transcript, imageDataUrl, mode: "voice", isExample: false });
         } catch (caught) { setError(caught instanceof Error ? caught.message : "Voice processing failed."); }
-        finally { setIsProcessing(false); }
+         finally { setIsProcessing(false); setProcessingStage("idle"); }
       };
       recorder.start(); mediaRecorder.current = recorder; setIsRecording(true); setRecordingSeconds(0);
       recordingTimer.current = setInterval(() => setRecordingSeconds((seconds) => seconds + 1), 1000);
@@ -224,9 +257,18 @@ function Index() {
   };
 
   const copyBrief = async () => {
-    if (!result) return;
+     if (!result) return;
     const brief = `${result.summary}\n\nNext actions:\n${result.nextActions.map((action, index) => `${index + 1}. ${action.title} — ${action.detail}`).join("\n")}`;
     await navigator.clipboard?.writeText(brief);
+  };
+
+  const restoreAuditEntry = (entry: BridgeAuditEntry) => {
+    setScenario(entry.scenario); setText(entry.text); setMode(entry.mode); setImageName(entry.imageName); setImageDataUrl(entry.imagePreview); setResult(entry.brief); setCompleted([]); setError("");
+  };
+
+  const clearHistory = () => {
+    if (!window.confirm("Clear all saved review entries?")) return;
+    clearBridgeAudit(); setAuditEntries([]);
   };
 
   const shareBrief = async () => {
@@ -268,7 +310,7 @@ function Index() {
               <div className="flex items-center justify-between border-b border-border px-4 py-3"><div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"><span className="size-1.5 rounded-full bg-primary" /> Live context</div><div className="font-mono text-[10px] text-muted-foreground">{text.length}/1200</div></div>
               <Textarea value={text} onChange={(event) => setText(event.target.value.slice(0, 1200))} placeholder={activeScenario.starter} className="min-h-[190px] resize-none rounded-none border-0 bg-transparent px-4 py-4 text-base leading-relaxed shadow-none focus-visible:ring-0" />
               {imageDataUrl && <div className="mx-4 mb-3 flex items-center gap-3 rounded-md border border-border bg-background/60 p-2"><img src={imageDataUrl} alt="Supporting context" className="size-12 rounded object-cover" /><div className="min-w-0 flex-1"><div className="truncate text-xs font-medium">{imageName}</div><div className="font-mono text-[10px] text-muted-foreground">Photo attached for context</div></div><Button variant="ghost" size="icon" aria-label="Remove photo" onClick={() => { setImageDataUrl(null); setImageName(""); }}><Check className="size-4 rotate-45" /></Button></div>}
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3"><div className="flex items-center gap-1"><Button variant={mode === "voice" ? "secondary" : "ghost"} size="sm" onClick={startRecording}>{isRecording ? <StopCircle className="size-4 text-signal" /> : <Mic className="size-4" />}{isRecording ? "Stop" : "Voice"}</Button><label className="inline-flex h-8 cursor-pointer items-center gap-2 rounded-md px-3 text-xs font-medium transition-colors hover:bg-accent hover:text-accent-foreground"><ImagePlus className="size-4" /> Photo<input type="file" accept="image/*" className="sr-only" onChange={handlePhoto} /></label><Button variant="ghost" size="sm" onClick={loadExample}><Play className="size-3.5" /> Try example</Button></div><Button onClick={processInput} disabled={isProcessing} size="lg" className="w-full sm:w-auto">{isProcessing ? <><Loader2 className="size-4 animate-spin" /> Structuring…</> : <><Sparkles className="size-4" /> Build action brief</>}</Button></div>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3"><div className="flex items-center gap-1"><Button variant={mode === "voice" ? "secondary" : "ghost"} size="sm" onClick={startRecording}>{isRecording ? <StopCircle className="size-4 text-signal" /> : <Mic className="size-4" />}{isRecording ? "Stop" : "Voice"}</Button><label className="inline-flex h-8 cursor-pointer items-center gap-2 rounded-md px-3 text-xs font-medium transition-colors hover:bg-accent hover:text-accent-foreground"><ImagePlus className="size-4" /> Photo<input type="file" accept="image/*" className="sr-only" onChange={handlePhoto} /></label><Button variant="ghost" size="sm" onClick={loadExample}><Play className="size-3.5" /> Try example</Button></div><Button onClick={() => void processInput()} disabled={isProcessing} size="lg" className="w-full sm:w-auto">{isProcessing ? <><Loader2 className="size-4 animate-spin" /> {processingStage === "transcribing" ? "Transcribing…" : processingStage === "checking" ? "Checking safety…" : "Building brief…"}</> : <><Sparkles className="size-4" /> Build action brief</>}</Button></div>
             </div>
             {isRecording && <div className="mt-3 flex items-center gap-2 font-mono text-xs text-signal"><span className="pulse-dot size-2 rounded-full bg-signal" /> Recording your complete voice note · 00:{String(recordingSeconds).padStart(2, "0")}</div>}
             {error && <div role="alert" className="mt-4 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"><AlertTriangle className="mt-0.5 size-4 shrink-0" /><span>{error}</span></div>}
@@ -279,7 +321,8 @@ function Index() {
             <div className="mb-6 flex items-center justify-between"><div><div className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">02 / Output</div><h2 className="mt-1 text-2xl font-semibold tracking-tight">Action brief</h2></div>{result && <div className="flex gap-1"><Button variant="ghost" size="icon" aria-label="Copy brief" onClick={copyBrief}><Clipboard className="size-4" /></Button><Button variant="ghost" size="icon" aria-label="Share brief" onClick={shareBrief}><Share2 className="size-4" /></Button></div>}</div>
             {!result ? <EmptyBrief scenario={scenario} onExample={loadExample} /> : <ActionBrief result={result} completed={completed} progress={progress} onToggle={(index) => setCompleted((current) => current.includes(index) ? current.filter((item) => item !== index) : [...current, index])} />}
           </div>
-        </section>
+         </section>
+         <AuditLog entries={auditEntries} onRestore={restoreAuditEntry} onClear={clearHistory} />
 
         <footer className="mt-12 flex flex-col gap-3 border-t border-border pt-4 font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground sm:flex-row sm:items-center sm:justify-between"><span>BridgeOS / A universal bridge for human intent</span><span className="flex items-center gap-2"><span className="size-1.5 rounded-full bg-signal" /> Built for moments that matter</span></footer>
       </div>
@@ -296,11 +339,27 @@ function ActionBrief({ result, completed, progress, onToggle }: { result: Bridge
   const urgencyClass = result.urgency === "critical" ? "bg-signal/15 text-signal-foreground border-signal/35" : result.urgency === "high" ? "bg-caution/30 text-caution-foreground border-caution/50" : "bg-accent text-accent-foreground border-accent";
   return <div className="space-y-4">
     <div className={`rounded-lg border p-5 ${urgencyClass}`}><div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2 font-mono text-[10px] font-medium uppercase tracking-[0.16em]"><span className="size-2 rounded-full bg-current" /> {result.urgencyLabel}</div><div className="font-mono text-[10px] uppercase tracking-wider">{Math.round(result.confidence * 100)}% signal confidence</div></div><p className="mt-4 max-w-2xl text-lg font-medium leading-relaxed">{result.summary}</p></div>
-    <div className="grid gap-4 sm:grid-cols-2"><BriefSection title="What we heard" icon={<Volume2 className="size-4" />}><div className="flex flex-wrap gap-2">{result.facts.map((fact) => <Badge key={fact} variant="outline" className="bg-background/55 text-xs font-normal">{fact}</Badge>)}</div></BriefSection><BriefSection title="Verification notes" icon={<ShieldCheck className="size-4" />}><ul className="space-y-2 text-xs leading-relaxed text-muted-foreground">{result.verification.map((item) => <li key={item} className="flex gap-2"><CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-signal" />{item}</li>)}</ul></BriefSection></div>
+     <div className="grid gap-4 sm:grid-cols-2"><BriefSection title="What we heard" icon={<Volume2 className="size-4" />}><div className="flex flex-wrap gap-2">{result.facts.map((fact) => <Badge key={fact} variant="outline" className="bg-background/55 text-xs font-normal">{fact}</Badge>)}</div></BriefSection><BriefSection title="Verification notes" icon={<ShieldCheck className="size-4" />}><ul className="space-y-2 text-xs leading-relaxed text-muted-foreground">{result.verificationNotes.map((item) => <li key={item} className="flex gap-2"><CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-signal" />{item}</li>)}</ul></BriefSection></div>
+     <VerificationPanel verification={result.verification} />
     <div className="rounded-lg border border-border bg-paper p-5"><div className="mb-4 flex items-center justify-between"><div><div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Recommended sequence</div><h3 className="mt-1 font-semibold">Next actions</h3></div><div className="text-right"><div className="font-mono text-xs text-primary">{progress}% complete</div><div className="mt-1 h-1 w-20 overflow-hidden rounded-full bg-muted"><div className="h-full bg-primary transition-all" style={{ width: `${progress}%` }} /></div></div></div><div className="space-y-2">{result.nextActions.map((action, index) => <button key={action.title} onClick={() => onToggle(index)} className={`flex w-full items-start gap-3 rounded-md border p-3 text-left transition-all hover:border-primary/40 ${completed.includes(index) ? "border-signal/40 bg-signal/5" : "border-border bg-background/45"}`}><span className={`mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full border ${completed.includes(index) ? "border-signal bg-signal text-signal-foreground" : "border-border"}`}>{completed.includes(index) ? <Check className="size-3" /> : <span className="font-mono text-[10px] text-muted-foreground">{index + 1}</span>}</span><span className="min-w-0 flex-1"><span className={`block text-sm font-medium ${completed.includes(index) ? "line-through opacity-60" : ""}`}>{action.title}</span><span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{action.detail}</span><span className="mt-2 inline-block font-mono text-[10px] uppercase tracking-wider text-primary/70">{action.owner} · {action.priority}</span></span><ChevronRight className="mt-1 size-4 shrink-0 text-muted-foreground" /></button>)}</div></div>
     <div className="grid gap-4 sm:grid-cols-2"><BriefSection title="Safety check" icon={<AlertTriangle className="size-4 text-signal" />} tone="signal"><ul className="space-y-2 text-xs leading-relaxed text-ink-soft">{result.safety.map((item) => <li key={item} className="flex gap-2"><span className="mt-1.5 size-1 shrink-0 rounded-full bg-signal" />{item}</li>)}</ul></BriefSection><BriefSection title="Still unclear" icon={<FileImage className="size-4" />}><ul className="space-y-2 text-xs leading-relaxed text-muted-foreground">{result.missing.map((item) => <li key={item} className="flex gap-2"><span className="font-mono text-primary">?</span>{item}</li>)}</ul></BriefSection></div>
     <div className="flex items-center gap-2 border-t border-border pt-4 text-[11px] leading-relaxed text-muted-foreground"><ShieldCheck className="size-4 shrink-0 text-signal" /> This brief is an aid for human judgment. Verify important details before acting.</div>
   </div>;
+}
+
+function VerificationPanel({ verification }: { verification: BridgeResult["verification"] }) {
+  const statusLabel = verification.status === "checked" ? "Checked" : verification.status === "needs_review" ? "Needs review" : "Safety hold";
+  const statusClass = verification.status === "checked" ? "border-signal/30 bg-signal/5" : verification.status === "needs_review" ? "border-caution/50 bg-caution/10" : "border-destructive/35 bg-destructive/5";
+  return <div className={`rounded-lg border p-5 ${statusClass}`}><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"><ShieldCheck className="size-4" /> Ruleset verification</div><h3 className="mt-2 text-lg font-semibold">{statusLabel}</h3></div><div className="text-right"><div className="font-mono text-xl font-medium text-primary">{Math.round(verification.confidence * 100)}%</div><div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">verified confidence</div></div></div><div className="mt-4 grid gap-4 text-xs sm:grid-cols-2"><div><div className="mb-2 font-mono uppercase tracking-wider text-muted-foreground">Passed checks</div><ul className="space-y-1.5">{verification.passed.map((item) => <li key={item} className="flex gap-2"><CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-signal" />{item}</li>)}</ul></div><div><div className="mb-2 font-mono uppercase tracking-wider text-muted-foreground">Review flags</div><ul className="space-y-1.5">{(verification.failed.length ? verification.failed : ["No blocking rule failures"]).map((item) => <li key={item} className="flex gap-2"><AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-signal" />{item}</li>)}</ul></div></div><div className="mt-4 border-t border-border/70 pt-3 text-xs text-muted-foreground">{verification.missingFields.length ? `Missing or unresolved: ${verification.missingFields.join(" · ")}` : "Required context was present for this pass."} Human review remains required before important action.</div></div>;
+}
+
+function AuditLog({ entries, onRestore, onClear }: { entries: BridgeAuditEntry[]; onRestore: (entry: BridgeAuditEntry) => void; onClear: () => void }) {
+  return <section className="mt-12 border-t border-border pt-5"><div className="mb-4 flex flex-wrap items-end justify-between gap-3"><div><div className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">03 / Review</div><h2 className="mt-1 text-2xl font-semibold tracking-tight">Audit log</h2><p className="mt-1 text-sm text-muted-foreground">Recent inputs and verified briefs stay available for the demo.</p></div>{entries.length > 0 && <Button variant="outline" size="sm" onClick={onClear}><Trash2 className="size-3.5" /> Clear history</Button>}</div>{entries.length === 0 ? <div className="flex items-center gap-3 rounded-lg border border-dashed border-border bg-paper/45 p-4 text-sm text-muted-foreground"><Clock3 className="size-4" /> Completed briefs will appear here for later review.</div> : <div className="space-y-2">{entries.map((entry) => <button key={entry.id} onClick={() => onRestore(entry)} className="flex w-full items-start gap-3 rounded-lg border border-border bg-paper p-3 text-left transition-colors hover:border-primary/45"><div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md bg-accent text-accent-foreground"><HistoryIcon scenario={entry.scenario} /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2 text-xs font-medium"><span>{scenarioData[entry.scenario].label}</span><Badge variant="outline" className="font-mono text-[9px] uppercase">{entry.mode}</Badge><Badge variant="outline" className="font-mono text-[9px] uppercase">{entry.brief.verification.status.replace("_", " ")}</Badge>{entry.isExample && <span className="font-mono text-[9px] uppercase text-muted-foreground">demo example</span>}</div><p className="mt-1 truncate text-sm text-muted-foreground">{entry.brief.summary}</p></div><div className="shrink-0 text-right font-mono text-[10px] text-muted-foreground">{Math.round(entry.brief.verification.confidence * 100)}%<br />{new Date(entry.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div></button>)}</div>}</section>;
+}
+
+function HistoryIcon({ scenario }: { scenario: BridgeScenario }) {
+  const Icon = scenarioData[scenario].icon;
+  return <Icon className="size-4" />;
 }
 
 function BriefSection({ title, icon, children, tone }: { title: string; icon: React.ReactNode; children: React.ReactNode; tone?: "signal" }) {
