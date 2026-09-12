@@ -20,13 +20,13 @@ export const Route = createFileRoute("/api/transcribe")({
         }
 
         const upstream = new FormData();
-        const extension = audio.type.includes("mp4") ? "mp4" : audio.type.includes("wav") ? "wav" : "webm";
+         const extension = audio.type.split("/")[1]?.split(";")[0] || "webm";
         upstream.append("model", "google/gemini-3.5-transcribe");
         upstream.append("file", audio, `bridgeos-recording.${extension}`);
 
         const response = await fetch("https://ai.gateway.lovable.dev/v1/audio/transcriptions", {
           method: "POST",
-          headers: { Authorization: `Bearer ${apiKey}` },
+           headers: { "Lovable-API-Key": apiKey },
           body: upstream,
         });
 
