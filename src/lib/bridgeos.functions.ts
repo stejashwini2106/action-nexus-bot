@@ -20,7 +20,7 @@ const bridgeResultSchema = z.object({
   nextActions: z.array(actionSchema),
   safety: z.array(z.string()),
   missing: z.array(z.string()),
-  verification: z.array(z.string()),
+  verificationNotes: z.array(z.string()),
 });
 
 const verificationSchema = z.object({
@@ -32,8 +32,9 @@ const verificationSchema = z.object({
 });
 
 export type BridgeScenario = "emergency" | "civic" | "accessibility";
-export type BridgeResult = z.infer<typeof bridgeResultSchema> & { verification: z.infer<typeof verificationSchema> };
-export type BridgeAnalysis = { extracted: z.infer<typeof bridgeResultSchema>; brief: BridgeResult };
+export type BridgeExtractedResult = z.infer<typeof bridgeResultSchema>;
+export type BridgeResult = BridgeExtractedResult & { verification: z.infer<typeof verificationSchema> };
+export type BridgeAnalysis = { extracted: BridgeExtractedResult; brief: BridgeResult };
 
 type AnalyzeInput = {
   scenario: BridgeScenario;

@@ -1,4 +1,4 @@
-import type { BridgeResult, BridgeScenario } from "./bridgeos.functions";
+import type { BridgeExtractedResult, BridgeResult, BridgeScenario } from "./bridgeos.functions";
 
 const STORAGE_KEY = "bridgeos-audit-log";
 const MAX_ENTRIES = 12;
@@ -11,7 +11,7 @@ export type BridgeAuditEntry = {
   text: string;
   imageName: string;
   imagePreview: string | null;
-  extracted: BridgeResult;
+  extracted: BridgeExtractedResult;
   brief: BridgeResult;
   isExample: boolean;
 };
